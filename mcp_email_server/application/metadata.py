@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Literal, Protocol, TypeVar
 
@@ -14,6 +14,7 @@ from mcp_email_server.application.limits import (
 )
 from mcp_email_server.config import sender_allowed
 from mcp_email_server.emails.models import EmailMetadata, EmailMetadataPageResponse, MailboxInfo
+from mcp_email_server.imap_keywords import ImapKeywordRegistry
 from mcp_email_server.log import logger
 
 RuntimeMode = Literal["legacy", "managed"]
@@ -63,6 +64,8 @@ class ListEmailMetadataQuery:
     body: str | None = None
     text: str | None = None
     has_attachment: bool | None = None
+    tags: tuple[str, ...] = ()
+    tag_match: Literal["all", "any"] = "all"
 
     def validate(self) -> None:
         validate_controlled_string(
@@ -86,6 +89,18 @@ class ListEmailMetadataQuery:
             field_name="subject query",
             maximum_bytes=APPLICATION_LIMITS.query_bytes,
         )
+        if len(self.tags) > APPLICATION_LIMITS.flags:
+            raise ValueError(f"tags must contain at most {APPLICATION_LIMITS.flags} values")
+        if len(set(self.tags)) != len(self.tags):
+            raise ValueError("tags must not contain duplicates")
+        for tag in self.tags:
+            validate_controlled_string(
+                tag,
+                field_name="tags item",
+                maximum_bytes=APPLICATION_LIMITS.flag_bytes,
+            )
+        if self.tag_match not in ("all", "any"):
+            raise ValueError("tag_match must be 'all' or 'any'")
         validate_optional_controlled_string(
             self.from_address,
             field_name="from_address query",
@@ -111,7 +126,7 @@ class ListEmailMetadataQuery:
     def index_supported(self) -> bool:
         # Provider text/date matching and mutable flag filters remain on IMAP
         # until equivalent projection semantics and invalidation are proven.
-        return all(
+        return not self.tags and all(
             value is None
             for value in (
                 self.before,
@@ -172,6 +187,8 @@ class MetadataProvider(Protocol):
 
     async def mailbox_snapshot(self, mailbox: str) -> MailboxMetadataSnapshot: ...
 
+    async def flags_for(self, mailbox: str, email_ids: tuple[str, ...]) -> dict[str, list[str]]: ...
+
 
 @dataclass(frozen=True)
 class MetadataProviderAccess:
@@ -197,7 +214,10 @@ class MetadataProjectionFactory(Protocol):
     async def open(self, account: MetadataAccountSnapshot) -> MetadataProjection: ...
 
 
-def _validate_snapshot(query: ListEmailMetadataQuery, snapshot: MailboxMetadataSnapshot) -> None:
+def _validate_snapshot(  # noqa: C901 - validate every independent provider-observation bound
+    query: ListEmailMetadataQuery,
+    snapshot: MailboxMetadataSnapshot,
+) -> None:
     state = snapshot.state
     if state.uidvalidity < 1 or state.uidnext < 1 or state.message_count < 0:
         raise MetadataProviderObservationError("Provider metadata state is invalid")
@@ -217,6 +237,23 @@ def _validate_snapshot(query: ListEmailMetadataQuery, snapshot: MailboxMetadataS
         or any(not isinstance(email.get("_internal_date"), datetime) for email in snapshot.emails)
     ):
         raise MetadataProviderObservationError("Complete provider metadata is inconsistent with mailbox state")
+    for email in snapshot.emails:
+        flags = email.get("_flags", [])
+        if (
+            not isinstance(flags, list)
+            or len(flags) > APPLICATION_LIMITS.flags
+            or any(not isinstance(flag, str) for flag in flags)
+        ):
+            raise MetadataProviderObservationError("Provider metadata flags are invalid")
+        try:
+            for flag in flags:
+                validate_controlled_string(
+                    flag,
+                    field_name="provider flag",
+                    maximum_bytes=APPLICATION_LIMITS.flag_bytes,
+                )
+        except ValueError:
+            raise MetadataProviderObservationError("Provider metadata flags are invalid") from None
 
 
 def _sort_key(email: dict[str, object], *, descending: bool) -> tuple[bool, datetime, int]:
@@ -228,6 +265,13 @@ def _sort_key(email: dict[str, object], *, descending: bool) -> tuple[bool, date
         return (descending, normalized.astimezone(UTC), uid)
     boundary = datetime.min.replace(tzinfo=UTC) if descending else datetime.max.replace(tzinfo=UTC)
     return (not descending, boundary, uid)
+
+
+def _email_flag_set(email: dict[str, object]) -> set[str]:
+    raw = email.get("_flags", [])
+    if not isinstance(raw, list) or any(not isinstance(flag, str) for flag in raw):
+        raise MetadataProviderObservationError("Provider metadata flags are invalid")
+    return set(raw)
 
 
 def _validate_metadata_response(
@@ -254,6 +298,8 @@ def _validate_metadata_response(
         + len(email.sender.encode("utf-8"))
         + sum(len(value.encode("utf-8")) for value in email.recipients)
         + sum(len(value.encode("utf-8")) for value in email.attachments)
+        + sum(len(value.encode("utf-8")) for value in email.tags)
+        + sum(len(value.encode("utf-8")) for value in email.tag_names)
         for email in response.emails
     )
     if header_bytes > APPLICATION_LIMITS.aggregate_header_bytes:
@@ -273,6 +319,17 @@ def _page_response(
     warnings: tuple[Literal["projection_write_failed"], ...] = (),
 ) -> EmailMetadataPageResponse:
     visible = [email for email in emails if sender_allowed(str(email.get("from", "")), list(allowed_senders))]
+    if query.tags:
+        requested = set(query.tags)
+        visible = [
+            email
+            for email in visible
+            if (
+                requested.issubset(_email_flag_set(email))
+                if query.tag_match == "all"
+                else bool(requested.intersection(_email_flag_set(email)))
+            )
+        ]
     visible.sort(key=lambda email: _sort_key(email, descending=query.order == "desc"), reverse=query.order == "desc")
     start = (query.page - 1) * query.page_size
     page = visible[start : start + query.page_size]
@@ -307,10 +364,61 @@ class MetadataQueryService:
         accounts: MetadataAccountAuthority,
         providers: MetadataProviderFactory,
         projections: MetadataProjectionFactory,
+        keyword_registry: ImapKeywordRegistry | None = None,
     ) -> None:
         self._accounts = accounts
         self._providers = providers
         self._projections = projections
+        self._keyword_registry = keyword_registry or ImapKeywordRegistry(accounts={})
+
+    def _decorate(
+        self,
+        query: ListEmailMetadataQuery,
+        response: EmailMetadataPageResponse,
+    ) -> EmailMetadataPageResponse:
+        decorated = response.model_copy(
+            update={
+                "emails": [
+                    email.model_copy(
+                        update={"tag_names": self._keyword_registry.semantic_names(query.account_name, email.tags)}
+                    )
+                    for email in response.emails
+                ]
+            }
+        )
+        return _validate_metadata_response(query, decorated)
+
+    async def _refresh_cached_tags(
+        self,
+        query: ListEmailMetadataQuery,
+        response: EmailMetadataPageResponse,
+        provider: MetadataProvider,
+    ) -> EmailMetadataPageResponse:
+        if not response.emails:
+            return response
+        email_ids = tuple(email.email_id for email in response.emails)
+        current_flags = await _bounded_provider_call(provider.flags_for(query.mailbox, email_ids))
+        if set(current_flags) != set(email_ids):
+            raise MetadataProviderObservationError("Provider returned incomplete flag metadata")
+        for flags in current_flags.values():
+            if len(flags) > APPLICATION_LIMITS.flags:
+                raise MetadataProviderObservationError("Provider metadata flags are invalid")
+            try:
+                for flag in flags:
+                    validate_controlled_string(
+                        flag,
+                        field_name="provider flag",
+                        maximum_bytes=APPLICATION_LIMITS.flag_bytes,
+                    )
+            except ValueError:
+                raise MetadataProviderObservationError("Provider metadata flags are invalid") from None
+        emails = [
+            email.model_copy(
+                update={"tags": [flag for flag in current_flags[email.email_id] if not flag.startswith("\\")]}
+            )
+            for email in response.emails
+        ]
+        return response.model_copy(update={"emails": emails})
 
     def _open_provider(self, query: ListEmailMetadataQuery, mode: RuntimeMode) -> MetadataProviderAccess:
         return self._providers.open(query.account_name, expected_mode=mode)
@@ -330,8 +438,10 @@ class MetadataQueryService:
     ) -> EmailMetadataPageResponse:
         query.validate()
         account = self._accounts.resolve(query.account_name)
+        if query.tags:
+            query = replace(query, tags=self._keyword_registry.resolve(query.account_name, query.tags))
         if not query.index_supported:
-            return await self._provider_fallback(query, account.mode)
+            return self._decorate(query, await self._provider_fallback(query, account.mode))
 
         try:
             projection = await self._projections.open(account)
@@ -339,7 +449,7 @@ class MetadataQueryService:
             if account.mode == "managed":
                 raise
             logger.warning("Operational metadata index is unavailable; using bounded provider fallback")
-            return await self._provider_fallback(query, account.mode)
+            return self._decorate(query, await self._provider_fallback(query, account.mode))
 
         # Re-resolve lifecycle authority immediately before each provider access.
         access = self._open_provider(query, account.mode)
@@ -347,7 +457,7 @@ class MetadataQueryService:
             state = await _bounded_provider_call(access.provider.mailbox_state(query.mailbox))
         except Exception:
             logger.warning("Metadata index qualification failed; using bounded provider fallback")
-            return await self._provider_fallback(query, account.mode)
+            return self._decorate(query, await self._provider_fallback(query, account.mode))
 
         try:
             indexed = await projection.read_complete(query.mailbox, state)
@@ -355,9 +465,11 @@ class MetadataQueryService:
             if account.mode == "managed":
                 raise
             logger.warning("Operational metadata index read failed; using bounded provider fallback")
-            return await self._provider_fallback(query, account.mode)
+            return self._decorate(query, await self._provider_fallback(query, account.mode))
         if indexed is not None:
-            return _page_response(query, indexed, access.account.allowed_senders)
+            cached = _page_response(query, indexed, access.account.allowed_senders)
+            refreshed = await self._refresh_cached_tags(query, cached, access.provider)
+            return self._decorate(query, refreshed)
 
         access = self._open_provider(query, account.mode)
         try:
@@ -366,7 +478,7 @@ class MetadataQueryService:
             raise
         except Exception:
             logger.warning("Metadata projection refresh failed; using bounded provider fallback")
-            return await self._provider_fallback(query, account.mode)
+            return self._decorate(query, await self._provider_fallback(query, account.mode))
 
         _validate_snapshot(query, snapshot)
         projection_write_failed = False
@@ -378,11 +490,15 @@ class MetadataQueryService:
             projection_write_failed = True
             logger.warning("Metadata projection write failed; returning bounded provider observation")
         if snapshot.complete:
-            return _page_response(
+            return self._decorate(
                 query,
-                [dict(email) for email in snapshot.emails],
-                access.account.allowed_senders,
-                warnings=("projection_write_failed",) if projection_write_failed else (),
+                _page_response(
+                    query,
+                    [dict(email) for email in snapshot.emails],
+                    access.account.allowed_senders,
+                    warnings=("projection_write_failed",) if projection_write_failed else (),
+                ),
             )
         response = await self._provider_fallback(query, account.mode)
-        return _with_projection_warning(query, response) if projection_write_failed else response
+        response = _with_projection_warning(query, response) if projection_write_failed else response
+        return self._decorate(query, response)

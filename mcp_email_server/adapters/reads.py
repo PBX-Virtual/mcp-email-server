@@ -86,6 +86,11 @@ class ClassicReadProvider:
                     date=email_data["date"],
                     body=email_data["body"],
                     attachments=email_data["attachments"],
+                    tags=[
+                        flag
+                        for flag in email_data.get("_flags", [])
+                        if isinstance(flag, str) and not flag.startswith("\\")
+                    ],
                 )
             except asyncio.CancelledError:
                 raise

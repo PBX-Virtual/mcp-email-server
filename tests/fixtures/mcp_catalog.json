@@ -83,6 +83,72 @@
             }
         },
         {
+            "name": "list_email_tags",
+            "description": "List the configured semantic IMAP tags for one account. The name and description support natural-language selection; writable is false unless explicitly enabled in imap_keywords.toml.",
+            "inputSchema": {
+                "properties": {
+                    "account_name": {
+                        "description": "The name of the email account.",
+                        "maxLength": 256,
+                        "title": "Account Name",
+                        "type": "string"
+                    }
+                },
+                "required": ["account_name"],
+                "title": "list_email_tagsArguments",
+                "type": "object"
+            },
+            "outputSchema": {
+                "$defs": {
+                    "ImapKeywordTag": {
+                        "additionalProperties": false,
+                        "description": "One semantic name mapped to one provider keyword.",
+                        "properties": {
+                            "name": {
+                                "title": "Name",
+                                "type": "string"
+                            },
+                            "keyword": {
+                                "title": "Keyword",
+                                "type": "string"
+                            },
+                            "description": {
+                                "default": "",
+                                "title": "Description",
+                                "type": "string"
+                            },
+                            "writable": {
+                                "default": false,
+                                "title": "Writable",
+                                "type": "boolean"
+                            }
+                        },
+                        "required": ["name", "keyword"],
+                        "title": "ImapKeywordTag",
+                        "type": "object"
+                    }
+                },
+                "properties": {
+                    "result": {
+                        "items": {
+                            "$ref": "#/$defs/ImapKeywordTag"
+                        },
+                        "title": "Result",
+                        "type": "array"
+                    }
+                },
+                "required": ["result"],
+                "title": "list_email_tagsOutput",
+                "type": "object"
+            },
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
             "name": "list_emails_metadata",
             "description": "List email metadata (email_id, subject, sender, recipients, date) without body content. Returns email_id for use with get_emails_content.",
             "inputSchema": {
@@ -271,6 +337,31 @@
                         "default": null,
                         "description": "Filter by attachment presence: True=has attachment, False=none, None=all (multipart/mixed heuristic; may miss inline images or yield false positives).",
                         "title": "Has Attachment"
+                    },
+                    "tags": {
+                        "anyOf": [
+                            {
+                                "items": {
+                                    "maxLength": 128,
+                                    "type": "string"
+                                },
+                                "maxItems": 100,
+                                "type": "array"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "default": null,
+                        "description": "Configured semantic tag names or their IMAP keywords.",
+                        "title": "Tags"
+                    },
+                    "tag_match": {
+                        "default": "all",
+                        "description": "Require all requested tags or at least any one requested tag.",
+                        "enum": ["all", "any"],
+                        "title": "Tag Match",
+                        "type": "string"
                     }
                 },
                 "required": ["account_name"],
@@ -323,6 +414,24 @@
                                     "type": "string"
                                 },
                                 "title": "Attachments",
+                                "type": "array"
+                            },
+                            "tags": {
+                                "items": {
+                                    "maxLength": 128,
+                                    "type": "string"
+                                },
+                                "maxItems": 100,
+                                "title": "Tags",
+                                "type": "array"
+                            },
+                            "tag_names": {
+                                "items": {
+                                    "maxLength": 128,
+                                    "type": "string"
+                                },
+                                "maxItems": 100,
+                                "title": "Tag Names",
                                 "type": "array"
                             }
                         },
@@ -524,6 +633,24 @@
                                     "type": "string"
                                 },
                                 "title": "Attachments",
+                                "type": "array"
+                            },
+                            "tags": {
+                                "items": {
+                                    "maxLength": 128,
+                                    "type": "string"
+                                },
+                                "maxItems": 100,
+                                "title": "Tags",
+                                "type": "array"
+                            },
+                            "tag_names": {
+                                "items": {
+                                    "maxLength": 128,
+                                    "type": "string"
+                                },
+                                "maxItems": 100,
+                                "title": "Tag Names",
                                 "type": "array"
                             },
                             "in_reply_to": {
@@ -1300,6 +1427,75 @@
             }
         },
         {
+            "name": "set_email_tags",
+            "description": "Add configured writable IMAP tags to emails, or replace only the configured writable tag subset. Names and keywords are both accepted. Standard flags, read-only tags, and unknown keywords are preserved.",
+            "inputSchema": {
+                "properties": {
+                    "account_name": {
+                        "description": "The name of the email account.",
+                        "maxLength": 256,
+                        "title": "Account Name",
+                        "type": "string"
+                    },
+                    "email_ids": {
+                        "description": "List of email_id values whose tags should be changed.",
+                        "items": {
+                            "maxLength": 10,
+                            "pattern": "^[1-9][0-9]*$",
+                            "type": "string"
+                        },
+                        "maxItems": 100,
+                        "minItems": 1,
+                        "title": "Email Ids",
+                        "type": "array"
+                    },
+                    "tags": {
+                        "description": "Configured writable semantic tag names or their IMAP keywords.",
+                        "items": {
+                            "maxLength": 128,
+                            "type": "string"
+                        },
+                        "maxItems": 100,
+                        "title": "Tags",
+                        "type": "array"
+                    },
+                    "mailbox": {
+                        "default": "INBOX",
+                        "description": "The mailbox containing the emails.",
+                        "maxLength": 1024,
+                        "title": "Mailbox",
+                        "type": "string"
+                    },
+                    "replace_existing": {
+                        "default": false,
+                        "description": "Replace only configured writable tags; false adds tags while preserving every existing tag.",
+                        "title": "Replace Existing",
+                        "type": "boolean"
+                    }
+                },
+                "required": ["account_name", "email_ids", "tags"],
+                "title": "set_email_tagsArguments",
+                "type": "object"
+            },
+            "outputSchema": {
+                "properties": {
+                    "result": {
+                        "title": "Result",
+                        "type": "string"
+                    }
+                },
+                "required": ["result"],
+                "title": "set_email_tagsOutput",
+                "type": "object"
+            },
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": true
+            }
+        },
+        {
             "name": "mark_emails_as_read",
             "description": "Mark one or more emails as read by email_id. This is the common-workflow equivalent of adding \\Seen with set_email_flags. Use list_emails_metadata first. Partial or ambiguous effects report per-ID succeeded/failed/unknown status and are not retried automatically.",
             "inputSchema": {
@@ -1535,6 +1731,225 @@
                 },
                 "required": ["result"],
                 "title": "list_mailboxesOutput",
+                "type": "object"
+            },
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": true
+            }
+        },
+        {
+            "name": "get_attachment_content",
+            "description": "Read one email attachment as an MCP embedded binary resource without writing a local file. The same enable_attachment_download=true policy and 25 MiB decoded-size limit apply.",
+            "inputSchema": {
+                "properties": {
+                    "account_name": {
+                        "description": "The name of the email account.",
+                        "maxLength": 256,
+                        "title": "Account Name",
+                        "type": "string"
+                    },
+                    "email_id": {
+                        "description": "The email ID obtained from list_emails_metadata or get_emails_content.",
+                        "maxLength": 10,
+                        "pattern": "^[1-9][0-9]*$",
+                        "title": "Email Id",
+                        "type": "string"
+                    },
+                    "attachment_name": {
+                        "description": "The attachment filename shown in the message's attachments list.",
+                        "maxLength": 4096,
+                        "title": "Attachment Name",
+                        "type": "string"
+                    },
+                    "mailbox": {
+                        "default": "INBOX",
+                        "description": "The mailbox containing the email.",
+                        "maxLength": 1024,
+                        "title": "Mailbox",
+                        "type": "string"
+                    }
+                },
+                "required": ["account_name", "email_id", "attachment_name"],
+                "title": "get_attachment_contentArguments",
+                "type": "object"
+            },
+            "outputSchema": {
+                "$defs": {
+                    "Annotations": {
+                        "additionalProperties": true,
+                        "properties": {
+                            "audience": {
+                                "anyOf": [
+                                    {
+                                        "items": {
+                                            "enum": ["user", "assistant"],
+                                            "type": "string"
+                                        },
+                                        "type": "array"
+                                    },
+                                    {
+                                        "type": "null"
+                                    }
+                                ],
+                                "default": null,
+                                "title": "Audience"
+                            },
+                            "priority": {
+                                "anyOf": [
+                                    {
+                                        "maximum": 1.0,
+                                        "minimum": 0.0,
+                                        "type": "number"
+                                    },
+                                    {
+                                        "type": "null"
+                                    }
+                                ],
+                                "default": null,
+                                "title": "Priority"
+                            }
+                        },
+                        "title": "Annotations",
+                        "type": "object"
+                    },
+                    "BlobResourceContents": {
+                        "additionalProperties": true,
+                        "description": "Binary contents of a resource.",
+                        "properties": {
+                            "uri": {
+                                "format": "uri",
+                                "minLength": 1,
+                                "title": "Uri",
+                                "type": "string"
+                            },
+                            "mimeType": {
+                                "anyOf": [
+                                    {
+                                        "type": "string"
+                                    },
+                                    {
+                                        "type": "null"
+                                    }
+                                ],
+                                "default": null,
+                                "title": "Mimetype"
+                            },
+                            "_meta": {
+                                "anyOf": [
+                                    {
+                                        "additionalProperties": true,
+                                        "type": "object"
+                                    },
+                                    {
+                                        "type": "null"
+                                    }
+                                ],
+                                "default": null,
+                                "title": "Meta"
+                            },
+                            "blob": {
+                                "title": "Blob",
+                                "type": "string"
+                            }
+                        },
+                        "required": ["uri", "blob"],
+                        "title": "BlobResourceContents",
+                        "type": "object"
+                    },
+                    "TextResourceContents": {
+                        "additionalProperties": true,
+                        "description": "Text contents of a resource.",
+                        "properties": {
+                            "uri": {
+                                "format": "uri",
+                                "minLength": 1,
+                                "title": "Uri",
+                                "type": "string"
+                            },
+                            "mimeType": {
+                                "anyOf": [
+                                    {
+                                        "type": "string"
+                                    },
+                                    {
+                                        "type": "null"
+                                    }
+                                ],
+                                "default": null,
+                                "title": "Mimetype"
+                            },
+                            "_meta": {
+                                "anyOf": [
+                                    {
+                                        "additionalProperties": true,
+                                        "type": "object"
+                                    },
+                                    {
+                                        "type": "null"
+                                    }
+                                ],
+                                "default": null,
+                                "title": "Meta"
+                            },
+                            "text": {
+                                "title": "Text",
+                                "type": "string"
+                            }
+                        },
+                        "required": ["uri", "text"],
+                        "title": "TextResourceContents",
+                        "type": "object"
+                    }
+                },
+                "additionalProperties": true,
+                "description": "The contents of a resource, embedded into a prompt or tool call result.\n\nIt is up to the client how best to render embedded resources for the benefit\nof the LLM and/or the user.",
+                "properties": {
+                    "type": {
+                        "const": "resource",
+                        "title": "Type",
+                        "type": "string"
+                    },
+                    "resource": {
+                        "anyOf": [
+                            {
+                                "$ref": "#/$defs/TextResourceContents"
+                            },
+                            {
+                                "$ref": "#/$defs/BlobResourceContents"
+                            }
+                        ],
+                        "title": "Resource"
+                    },
+                    "annotations": {
+                        "anyOf": [
+                            {
+                                "$ref": "#/$defs/Annotations"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "default": null
+                    },
+                    "_meta": {
+                        "anyOf": [
+                            {
+                                "additionalProperties": true,
+                                "type": "object"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "default": null,
+                        "title": "Meta"
+                    }
+                },
+                "required": ["type", "resource"],
+                "title": "EmbeddedResource",
                 "type": "object"
             },
             "annotations": {

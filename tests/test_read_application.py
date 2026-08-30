@@ -11,6 +11,7 @@ from mcp_email_server.application import limits as limits_module
 from mcp_email_server.application import reads as reads_module
 from mcp_email_server.application.mutations import APPLICATION_LIMITS, BatchMutationOutcome, TargetMutationOutcome
 from mcp_email_server.application.reads import (
+    AttachmentContentService,
     AttachmentDownloadService,
     AttachmentPayload,
     DownloadAttachmentCommand,
@@ -23,6 +24,7 @@ from mcp_email_server.application.reads import (
     ReadProviderError,
 )
 from mcp_email_server.emails.models import EmailBodyResponse, EmailContentBatchResponse, MailboxInfo
+from mcp_email_server.imap_keywords import ImapKeywordAccount, ImapKeywordRegistry, ImapKeywordTag
 
 
 def _account(*, downloads: bool = False) -> ReadAccountSnapshot:
@@ -138,6 +140,70 @@ async def test_content_service_preserves_bodies_when_marking_fails() -> None:
     )
 
     assert result == response
+
+
+@pytest.mark.asyncio
+async def test_content_service_maps_configured_names_and_preserves_unknown_tags() -> None:
+    authority, factory, provider = _ports()
+    body = _body("1").model_copy(update={"tags": ["$label4", "provider-keyword"]})
+    provider.get_content = AsyncMock(
+        return_value=EmailContentBatchResponse(emails=[body], requested_count=1, retrieved_count=1, failed_ids=[])
+    )
+    mark_read = Mock()
+    registry = ImapKeywordRegistry(
+        accounts={"work": ImapKeywordAccount(tags=(ImapKeywordTag(name="todo", keyword="$label4"),))}
+    )
+
+    result = await EmailContentService(authority, factory, mark_read, None, registry).execute(
+        GetEmailContentQuery(account_name="work", email_ids=("1",))
+    )
+
+    assert result.emails[0].tags == ["$label4", "provider-keyword"]
+    assert result.emails[0].tag_names == ["todo"]
+
+
+@pytest.mark.asyncio
+async def test_attachment_content_accepts_exact_limit_and_rechecks_policy(monkeypatch) -> None:
+    monkeypatch.setattr(
+        reads_module,
+        "APPLICATION_LIMITS",
+        replace(reads_module.APPLICATION_LIMITS, attachment_bytes=3),
+    )
+    authority, factory, provider = _ports(initial=_account(downloads=True), fresh=_account(downloads=True))
+    authority.resolve.side_effect = [_account(downloads=True), _account(downloads=True)]
+    payload = AttachmentPayload("1", "document.pdf", "application/pdf", b"123")
+    provider.fetch_attachment = AsyncMock(return_value=payload)
+
+    result = await AttachmentContentService(authority, factory).execute(
+        DownloadAttachmentCommand("work", "1", "document.pdf")
+    )
+
+    assert result is payload
+    assert authority.resolve.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_attachment_content_rejects_disabled_and_oversized(monkeypatch) -> None:
+    authority, factory, provider = _ports(initial=_account(downloads=False))
+    with pytest.raises(PermissionError, match="disabled"):
+        await AttachmentContentService(authority, factory).execute(
+            DownloadAttachmentCommand("work", "1", "document.pdf")
+        )
+    factory.open.assert_not_called()
+
+    monkeypatch.setattr(
+        reads_module,
+        "APPLICATION_LIMITS",
+        replace(reads_module.APPLICATION_LIMITS, attachment_bytes=3),
+    )
+    authority, factory, provider = _ports(initial=_account(downloads=True), fresh=_account(downloads=True))
+    provider.fetch_attachment = AsyncMock(
+        return_value=AttachmentPayload("1", "document.pdf", "application/pdf", b"1234")
+    )
+    with pytest.raises(ValueError, match="exceeds 3 bytes"):
+        await AttachmentContentService(authority, factory).execute(
+            DownloadAttachmentCommand("work", "1", "document.pdf")
+        )
 
 
 @pytest.mark.asyncio

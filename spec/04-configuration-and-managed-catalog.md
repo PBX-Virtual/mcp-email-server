@@ -179,6 +179,35 @@ restrict reading. Permissive changes do not bypass capability or input
 validation. Restrictive changes take effect on the next independent effect
 because authority is revalidated at operation boundaries.
 
+## Semantic IMAP Keyword Configuration
+
+Semantic IMAP tags are process-scoped mail-workflow configuration, not managed
+catalog or UI authority. The MCP process reads the independent
+`~/.config/mcp-email-server/imap_keywords.toml` file once at startup; the local
+management UI never reads, rewrites, imports, or persists it in
+`managed.sqlite3`. Configuration is separated by exact `account_name`:
+
+```toml
+[accounts.sales]
+
+[[accounts.sales.tags]]
+name = "todo"
+keyword = "$label4"
+description = "Messages requiring an action"
+writable = true
+```
+
+Each tag requires non-empty `name` and `keyword`. `description` defaults to the
+empty string and `writable` defaults to `false`; write authority therefore
+requires an explicit `writable = true`. Names and keywords are each unique
+within an account. A keyword is one bounded non-system IMAP atom: system flags
+such as `\Seen`, protocol controls, whitespace, and atom-special characters are
+rejected. The file and all collections use the centralized configuration and
+string bounds. An absent file is an empty mapping; malformed configuration
+fails process startup without provider work. A mapping for an account not in
+current runtime authority has no effect, and attempting to use that account
+returns the ordinary controlled unknown/unavailable-account error.
+
 ## Legacy Mode
 
 Legacy mode preserves established TOML and environment composition. New managed
@@ -346,3 +375,7 @@ SQL, raw provider responses, or reusable locators.
     satisfy spec 08's reparse, ACL, identity, lock, WAL/SHM, replacement, and
     crash-recovery contract; unsupported Windows path/filesystem classes fail
     before authority or secret effects.
+12. Semantic keyword configuration is independently loaded and bounded, is
+    never rewritten by the UI or catalog, rejects invalid, duplicate, or system
+    keyword mappings, and proves that omitted `description` and `writable`
+    values become `""` and `false`.

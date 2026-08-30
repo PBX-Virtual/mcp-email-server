@@ -93,6 +93,8 @@ The stable mail catalog may expose these compatibility families:
 - metadata listing and querying;
 - body and attachment reads;
 - flag/read-state mutations;
+- semantic keyword discovery, filtering, and explicitly authorized tag
+  mutations;
 - save/append, move, archive, and delete;
 - SMTP send and sent-copy behavior.
 
@@ -110,6 +112,8 @@ MCP-specific ceilings include:
 - maximum serialized success/partial response bytes;
 - maximum mailbox items and aggregate mailbox-name/attribute bytes;
 - maximum per-item and aggregate metadata/body detail;
+- at most the centralized flag-count bound for configured or requested tags and
+  25 MiB of decoded content for one embedded attachment resource;
 - maximum target IDs, recipients, headers, and message bytes;
 - maximum warnings, failures, unknown outcomes, and error-detail bytes;
 - bounded string lengths for account/description/mailbox/path/query fields;
@@ -217,3 +221,7 @@ model.
    the explicit non-secret capability DTO.
 9. The catalog contains no MCP App, account/credential management, agent
    installation, or graphical management resource.
+10. The catalog and raw stdio tests cover `list_email_tags`, tag-aware
+    `list_emails_metadata` and `get_emails_content`, `set_email_tags`, and
+    `get_attachment_content`, including defaults, name-or-keyword inputs,
+    annotations, schemas, embedded blob content, limits, and policy failures.

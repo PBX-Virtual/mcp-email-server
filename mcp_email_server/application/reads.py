@@ -23,6 +23,7 @@ from mcp_email_server.emails.models import (
     EmailContentBatchResponse,
     MailboxInfo,
 )
+from mcp_email_server.imap_keywords import ImapKeywordRegistry
 from mcp_email_server.log import logger
 
 MAX_CONTENT_EMAIL_IDS = APPLICATION_LIMITS.content_email_ids
@@ -256,6 +257,8 @@ def _validate_content_result(response: EmailContentBatchResponse) -> bytes:
         + len(email.sender.encode("utf-8"))
         + sum(len(value.encode("utf-8")) for value in email.recipients)
         + sum(len(value.encode("utf-8")) for value in email.attachments)
+        + sum(len(value.encode("utf-8")) for value in email.tags)
+        + sum(len(value.encode("utf-8")) for value in email.tag_names)
         for email in response.emails
     )
     if header_bytes > APPLICATION_LIMITS.aggregate_header_bytes:
@@ -291,11 +294,13 @@ class EmailContentService:
         providers: ReadProviderFactory,
         mark_read: MarkReadExecutor,
         large_results: LargeResultWriter | None = None,
+        keyword_registry: ImapKeywordRegistry | None = None,
     ) -> None:
         self._accounts = accounts
         self._providers = providers
         self._mark_read = mark_read
         self._large_results = large_results
+        self._keyword_registry = keyword_registry or ImapKeywordRegistry(accounts={})
 
     async def _prepare_result(
         self,
@@ -334,6 +339,16 @@ class EmailContentService:
         account = self._accounts.resolve(query.account_name)
         access = self._providers.open(account.account_name, expected_mode=account.mode)
         response = await _bounded_provider_call(access.provider.get_content(query, access.account))
+        response = response.model_copy(
+            update={
+                "emails": [
+                    email.model_copy(
+                        update={"tag_names": self._keyword_registry.semantic_names(query.account_name, email.tags)}
+                    )
+                    for email in response.emails
+                ]
+            }
+        )
         serialized = _validate_content_result(response)
         prepared = await self._prepare_result(response, serialized)
         if not query.mark_as_read or not response.emails:
@@ -410,11 +425,42 @@ class AttachmentDownloadService:
         return response
 
 
+class AttachmentContentService:
+    """Return attachment bytes through MCP without performing a filesystem effect."""
+
+    def __init__(self, accounts: ReadAccountAuthority, providers: ReadProviderFactory) -> None:
+        self._accounts = accounts
+        self._providers = providers
+
+    async def execute(self, command: DownloadAttachmentCommand) -> AttachmentPayload:
+        command.validate()
+        account = self._accounts.resolve(command.account_name)
+        if not account.enable_attachment_download:
+            raise PermissionError(
+                "Attachment download is disabled. Set 'enable_attachment_download=true' in settings to enable this feature."
+            )
+        access = self._providers.open(account.account_name, expected_mode=account.mode)
+        if not access.account.enable_attachment_download:
+            raise PermissionError(
+                "Attachment download is disabled. Set 'enable_attachment_download=true' in settings to enable this feature."
+            )
+        payload = await _bounded_provider_call(access.provider.fetch_attachment(command, access.account))
+        if len(payload.content) > APPLICATION_LIMITS.attachment_bytes:
+            raise ValueError(f"attachment exceeds {APPLICATION_LIMITS.attachment_bytes} bytes")
+        current = self._accounts.resolve(command.account_name, expected_mode=access.account.mode)
+        if not current.enable_attachment_download:
+            raise PermissionError(
+                "Attachment download is disabled. Set 'enable_attachment_download=true' in settings to enable this feature."
+            )
+        return payload
+
+
 @dataclass(frozen=True)
 class ReadServices:
     mailboxes: MailboxDiscoveryService
     content: EmailContentService
     attachments: AttachmentDownloadService
+    attachment_content: AttachmentContentService
 
     @classmethod
     def compose(
@@ -424,9 +470,11 @@ class ReadServices:
         mark_read: MarkReadExecutor,
         artifacts: ArtifactWriter,
         large_results: LargeResultWriter | None = None,
+        keyword_registry: ImapKeywordRegistry | None = None,
     ) -> ReadServices:
         return cls(
             mailboxes=MailboxDiscoveryService(accounts, providers),
-            content=EmailContentService(accounts, providers, mark_read, large_results),
+            content=EmailContentService(accounts, providers, mark_read, large_results, keyword_registry),
             attachments=AttachmentDownloadService(accounts, providers, artifacts),
+            attachment_content=AttachmentContentService(accounts, providers),
         )

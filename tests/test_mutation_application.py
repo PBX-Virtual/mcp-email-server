@@ -35,9 +35,11 @@ from mcp_email_server.application.mutations import (
     SendMutationOutcome,
     SentCopyMutationOutcome,
     SetEmailFlagsCommand,
+    SetEmailTagsCommand,
     TargetMutationOutcome,
 )
 from mcp_email_server.emails.classic import ClassicEmailHandler
+from mcp_email_server.imap_keywords import ImapKeywordAccount, ImapKeywordRegistry, ImapKeywordTag
 
 
 def _account(**changes: object) -> MutationAccountSnapshot:
@@ -61,6 +63,7 @@ def _services(
     account: MutationAccountSnapshot | None = None,
     provider: MagicMock | None = None,
     projection: MagicMock | None = None,
+    keyword_registry: ImapKeywordRegistry | None = None,
 ) -> tuple[MutationServices, MagicMock, MagicMock, MagicMock]:
     current = account if account is not None else _account()
     authority = MagicMock()
@@ -74,11 +77,59 @@ def _services(
     projections = MagicMock()
     projections.open = AsyncMock(return_value=selected_projection)
     return (
-        MutationServices.compose(authority, factory, projections),
+        MutationServices.compose(authority, factory, projections, keyword_registry),
         authority,
         factory,
         selected_projection,
     )
+
+
+def _tag_registry() -> ImapKeywordRegistry:
+    return ImapKeywordRegistry(
+        accounts={
+            "primary": ImapKeywordAccount(
+                tags=(
+                    ImapKeywordTag(name="todo", keyword="$label4", writable=True),
+                    ImapKeywordTag(name="important", keyword="$label1", writable=False),
+                )
+            )
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_set_email_tags_resolves_writable_names_and_invalidates_projection() -> None:
+    provider = MagicMock()
+    provider.set_tags = AsyncMock(return_value=_batch(TargetMutationOutcome("1", "succeeded")))
+    services, _authority, _factory, projection = _services(
+        provider=provider,
+        keyword_registry=_tag_registry(),
+    )
+
+    result = await services.set_tags.execute(SetEmailTagsCommand("primary", ("1",), ("todo",), replace_existing=True))
+
+    assert result.targets("succeeded") == ["1"]
+    dispatched = provider.set_tags.await_args.args[0]
+    assert dispatched.tags == ("$label4",)
+    assert dispatched.writable_keywords == ("$label4",)
+    projection.invalidate.assert_awaited_once_with(("INBOX",))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tag", ["missing", "important"])
+async def test_set_email_tags_rejects_unknown_or_read_only_before_provider(tag: str) -> None:
+    services, _authority, factory, _projection = _services(keyword_registry=_tag_registry())
+
+    with pytest.raises((ValueError, PermissionError)):
+        await services.set_tags.execute(SetEmailTagsCommand("primary", ("1",), (tag,)))
+
+    factory.open.assert_not_called()
+
+
+def test_set_email_tags_empty_list_requires_replace() -> None:
+    with pytest.raises(ValueError, match="unless replace_existing"):
+        SetEmailTagsCommand("primary", ("1",), ()).validate()
+    SetEmailTagsCommand("primary", ("1",), (), replace_existing=True).validate()
 
 
 @pytest.mark.parametrize(

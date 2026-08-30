@@ -82,6 +82,8 @@ class ClassicMetadataProvider:
                 body=query.body,
                 text=query.text,
                 has_attachment=query.has_attachment,
+                tag_keywords=list(query.tags),
+                tag_match=query.tag_match,
                 allowed_senders=list(account.allowed_senders),
             )
         )
@@ -105,6 +107,9 @@ class ClassicMetadataProvider:
                 maximum_window=MAX_INDEXED_UID_WINDOW,
             )
         )
+
+    async def flags_for(self, mailbox: str, email_ids: tuple[str, ...]) -> dict[str, list[str]]:
+        return await _bounded_provider_call(self._handler.incoming_client.get_email_flags(list(email_ids), mailbox))
 
 
 class SQLiteMetadataProjection:

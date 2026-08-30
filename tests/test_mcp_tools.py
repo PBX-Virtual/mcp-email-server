@@ -4,7 +4,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from mcp.types import TextContent
+from mcp.types import BlobResourceContents, EmbeddedResource, TextContent
 
 from mcp_email_server import app as app_module
 from mcp_email_server.app import (
@@ -12,10 +12,12 @@ from mcp_email_server.app import (
     delete_emails,
     download_attachment,
     forward_email,
+    get_attachment_content,
     get_emails_content,
     list_allowed_recipients,
     list_allowed_senders,
     list_available_accounts,
+    list_email_tags,
     list_emails_metadata,
     list_mailboxes,
     mark_emails_as_read,
@@ -23,6 +25,7 @@ from mcp_email_server.app import (
     save_to_mailbox,
     send_email,
     set_email_flags,
+    set_email_tags,
 )
 from mcp_email_server.application.accounts import AvailableAccount, EffectiveConfiguration
 from mcp_email_server.application.limits import APPLICATION_LIMITS
@@ -34,8 +37,10 @@ from mcp_email_server.application.mutations import (
     SendMutationOutcome,
     SentCopyMutationOutcome,
     SetEmailFlagsCommand,
+    SetEmailTagsCommand,
     TargetMutationOutcome,
 )
+from mcp_email_server.application.reads import AttachmentPayload
 from mcp_email_server.config import EmailServer, EmailSettings, ProviderSettings
 from mcp_email_server.emails.models import (
     AttachmentDownloadResponse,
@@ -45,6 +50,7 @@ from mcp_email_server.emails.models import (
     EmailMetadataPageResponse,
     MailboxInfo,
 )
+from mcp_email_server.imap_keywords import ImapKeywordAccount, ImapKeywordRegistry, ImapKeywordTag
 
 
 def _batch_outcome(
@@ -1280,3 +1286,74 @@ async def test_tool_annotations_expose_agent_safety_and_retry_hints() -> None:
         "openWorldHint": True,
     }
     assert all(tool.annotations is not None for tool in tools.values())
+
+
+@pytest.mark.asyncio
+async def test_list_email_tags_returns_safe_defaults() -> None:
+    registry = ImapKeywordRegistry(
+        accounts={"work": ImapKeywordAccount(tags=(ImapKeywordTag(name="todo", keyword="$label4"),))}
+    )
+    runtime = MagicMock()
+    runtime.accounts.discover_one.return_value = object()
+    runtime.keyword_registry = registry
+
+    with patch("mcp_email_server.app.get_application_runtime", return_value=runtime):
+        result = await list_email_tags("work")
+
+    assert [tag.model_dump() for tag in result] == [
+        {"name": "todo", "keyword": "$label4", "description": "", "writable": False}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_set_email_tags_maps_command_and_allows_empty_replace() -> None:
+    command_handler = AsyncMock(return_value=_batch_outcome(succeeded=("1",)))
+    with patch("mcp_email_server.app.set_email_tags_command", command_handler):
+        result = await set_email_tags("work", ["1"], [], replace_existing=True)
+
+    assert result == "Successfully replaced configured tags on 1 email(s)"
+    assert command_handler.await_args.args[0] == SetEmailTagsCommand(
+        account_name="work",
+        email_ids=("1",),
+        tags=(),
+        replace_existing=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_attachment_content_returns_blob_resource_with_metadata() -> None:
+    payload = AttachmentPayload("7", "report.pdf", "application/pdf", b"pdf-bytes")
+    command_handler = AsyncMock(return_value=payload)
+    with patch("mcp_email_server.app.get_attachment_content_command", command_handler):
+        result = await get_attachment_content("work", "7", "report.pdf", mailbox="Archive")
+
+    assert isinstance(result.resource, BlobResourceContents)
+    assert str(result.resource.uri) == "email-attachment://work/Archive/7/report.pdf"
+    assert result.resource.mimeType == "application/pdf"
+    assert result.resource.blob == "cGRmLWJ5dGVz"
+    assert result.meta == {"filename": "report.pdf", "size": 9}
+    assert command_handler.await_args.args[0].save_path is None
+
+
+@pytest.mark.asyncio
+async def test_attachment_blob_survives_fastmcp_tool_adapter() -> None:
+    payload = AttachmentPayload("7", "photo.png", "image/png", b"png")
+    with patch(
+        "mcp_email_server.app.get_attachment_content_command",
+        AsyncMock(return_value=payload),
+    ):
+        content, _structured = await app_module.mcp.call_tool(
+            "get_attachment_content",
+            {
+                "account_name": "work",
+                "email_id": "7",
+                "attachment_name": "photo.png",
+                "mailbox": "INBOX",
+            },
+        )
+
+    assert len(content) == 1
+    assert isinstance(content[0], EmbeddedResource)
+    assert isinstance(content[0].resource, BlobResourceContents)
+    assert content[0].resource.blob == "cG5n"
+    assert content[0].meta == {"filename": "photo.png", "size": 3}

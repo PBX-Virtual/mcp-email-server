@@ -34,6 +34,7 @@ from mcp_email_server.application.mutations import (
     SendCommand,
     SentCopyMutationOutcome,
     SetEmailFlagsCommand,
+    SetEmailTagsCommand,
 )
 from mcp_email_server.config import EmailSettings, Settings
 from mcp_email_server.emails.classic import ClassicEmailHandler, _validate_flags
@@ -84,6 +85,23 @@ class ClassicMutationProvider:
                 command.operation,
                 list(command.flags),
                 command.mailbox,
+                list(account.allowed_senders),
+                account.report_blocked_mutations,
+            )
+        )
+
+    async def set_tags(
+        self,
+        command: SetEmailTagsCommand,
+        account: MutationAccountSnapshot,
+    ) -> BatchMutationOutcome:
+        return await _bounded_mutation_call(
+            self._handler.incoming_client.set_email_tags_with_outcome(
+                list(command.email_ids),
+                list(command.tags),
+                command.mailbox,
+                command.replace_existing,
+                list(command.writable_keywords),
                 list(account.allowed_senders),
                 account.report_blocked_mutations,
             )

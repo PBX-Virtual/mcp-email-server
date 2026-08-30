@@ -1454,7 +1454,7 @@ class EmailClient:
         return f'"{escaped}"'
 
     @staticmethod
-    def _build_search_criteria(
+    def _build_search_criteria(  # noqa: C901 - explicit independent IMAP search keys
         before: datetime | None = None,
         since: datetime | None = None,
         subject: str | None = None,
@@ -1466,6 +1466,8 @@ class EmailClient:
         flagged: bool | None = None,
         answered: bool | None = None,
         has_attachment: bool | None = None,
+        tag_keywords: list[str] | None = None,
+        tag_match: Literal["all", "any"] = "all",
     ) -> list[ImapSearchToken]:
         search_criteria: list[ImapSearchToken] = []
         if before:
@@ -1501,6 +1503,20 @@ class EmailClient:
         for flag_value, criteria_map in flag_criteria:
             if flag_value in criteria_map:
                 search_criteria.append(criteria_map[flag_value])
+
+        keywords = tag_keywords or []
+        if tag_match not in ("all", "any"):
+            raise ValueError("tag_match must be 'all' or 'any'")
+        for keyword in keywords:
+            if not _is_valid_imap_flag(keyword) or keyword.startswith("\\"):
+                raise ValueError("Invalid configured IMAP keyword")
+        if keywords and tag_match == "all":
+            for keyword in keywords:
+                search_criteria.extend(["KEYWORD", keyword])
+        elif keywords and tag_match == "any":
+            search_criteria.extend(["OR"] * (len(keywords) - 1))
+            for keyword in keywords:
+                search_criteria.extend(["KEYWORD", keyword])
 
         return search_criteria or ["ALL"]
 
@@ -1672,6 +1688,47 @@ class EmailClient:
                         )
                     results[uid] = metadata
         return results
+
+    async def _batch_fetch_flags(
+        self,
+        imap: aioimaplib.IMAP4_SSL | aioimaplib.IMAP4,
+        email_ids: list[str],
+        *,
+        chunk_size: int = 500,
+    ) -> dict[str, list[str]]:
+        if not email_ids:
+            return {}
+        results: dict[str, list[str]] = {}
+        for start in range(0, len(email_ids), chunk_size):
+            chunk = email_ids[start : start + chunk_size]
+            response = await imap.uid("fetch", ",".join(chunk), "(FLAGS)")
+            _raise_for_imap_command_failure(response, f"FETCH flags for {len(chunk)} UIDs")
+            for item in response[1]:
+                if not isinstance(item, bytes):
+                    continue
+                uid_match = re.search(rb"UID (\d+)", item)
+                flags_match = re.search(rb"FLAGS \(([^)]*)\)", item)
+                if uid_match is not None and flags_match is not None:
+                    results[uid_match.group(1).decode()] = flags_match.group(1).decode(errors="replace").split()
+        return results
+
+    async def get_email_flags(self, email_ids: list[str], mailbox: str = "INBOX") -> dict[str, list[str]]:
+        """Fetch current flags for a bounded UID page without reading headers or bodies."""
+        _validate_imap_uids(email_ids)
+        if len(email_ids) > 100:
+            raise ValueError("email_ids must contain at most 100 values")
+        imap = await self._connect_imap()
+        try:
+            await _imap_login(imap, self.email_server.user_name, self.email_server.password.get_secret_value())
+            await _send_imap_id(imap)
+            select_response = await imap.select(_quote_mailbox(mailbox))
+            _raise_for_imap_error(select_response, f"SELECT mailbox {mailbox}")
+            flags = await self._batch_fetch_flags(imap, email_ids)
+            if set(flags) != set(email_ids):
+                raise RuntimeError("Provider returned incomplete flag metadata")
+            return flags
+        finally:
+            await _best_effort_imap_logout(imap)
 
     async def _batch_fetch_senders(
         self,
@@ -1881,6 +1938,8 @@ class EmailClient:
         body: str | None = None,
         text: str | None = None,
         has_attachment: bool | None = None,
+        tag_keywords: list[str] | None = None,
+        tag_match: Literal["all", "any"] = "all",
         allowed_senders: list[str] | None = None,
     ) -> tuple[int, list[dict[str, Any]]]:
         if page < 1:
@@ -1907,6 +1966,8 @@ class EmailClient:
                 flagged=flagged,
                 answered=answered,
                 has_attachment=has_attachment,
+                tag_keywords=tag_keywords,
+                tag_match=tag_match,
             )
             logger.info(f"Get metadata: Search criteria: {search_criteria}")
 
@@ -1984,7 +2045,9 @@ class EmailClient:
 
             # Phase 2: Batch fetch headers for requested page only
             fetch_headers_start = time.perf_counter()
-            metadata_by_uid = await self._batch_fetch_headers(imap, page_uids, header_budget=header_budget)
+            metadata_by_uid = await self._batch_fetch_headers(
+                imap, page_uids, include_flags=True, header_budget=header_budget
+            )
             fetch_headers_elapsed = time.perf_counter() - fetch_headers_start
 
             logger.info(
@@ -2034,9 +2097,19 @@ class EmailClient:
                 return payload
         return None
 
+    @staticmethod
+    def _extract_message_flags(data: list) -> list[str]:
+        for item in data:
+            if not isinstance(item, bytes):
+                continue
+            match = re.search(rb"FLAGS \(([^)]*)\)", item)
+            if match is not None:
+                return match.group(1).decode(errors="replace").split()
+        return []
+
     async def _fetch_email_with_formats(self, imap, email_id: str) -> list | None:
         """Try non-mutating fetch formats to get email data."""
-        fetch_formats = ["BODY.PEEK[]", "(BODY.PEEK[])"]
+        fetch_formats = ["(FLAGS BODY.PEEK[])", "FLAGS BODY.PEEK[]"]
 
         for fetch_format in fetch_formats:
             try:
@@ -2099,6 +2172,7 @@ class EmailClient:
                 email_data = self._parse_email_data(
                     raw_email, email_id, body_offset=body_offset, max_body_length=max_body_length
                 )
+                email_data["_flags"] = self._extract_message_flags(data)
             except Exception as e:
                 logger.error(f"Error parsing email: {e!s}")
                 return None
@@ -3201,6 +3275,105 @@ class EmailClient:
                         else "store-unknown",
                     )
                 )
+        finally:
+            await _best_effort_imap_logout(imap)
+        return BatchMutationOutcome(tuple(outcomes))
+
+    async def set_email_tags_with_outcome(  # noqa: C901 - preserve per-UID two-effect evidence
+        self,
+        email_ids: list[str],
+        tags: list[str],
+        mailbox: str = "INBOX",
+        replace_existing: bool = False,
+        writable_keywords: list[str] | None = None,
+        allowed_senders: list[str] | None = None,
+        report_blocked_mutations: bool = False,
+    ) -> BatchMutationOutcome:
+        """Add or replace only explicitly configured writable IMAP keywords."""
+        _validate_imap_uids(email_ids)
+        if not tags and not replace_existing:
+            raise ValueError("tags must not be empty unless replace_existing is true")
+        writable = writable_keywords or []
+        if len(tags) > APPLICATION_LIMITS.flags or len(writable) > APPLICATION_LIMITS.flags:
+            raise ValueError(f"tags must contain at most {APPLICATION_LIMITS.flags} values")
+        if any(not isinstance(tag, str) for tag in (*tags, *writable)):
+            raise ValueError("tags must contain strings")
+        if len(set(tags)) != len(tags) or len(set(writable)) != len(writable):
+            raise ValueError("tags must not contain duplicates")
+        if any(tag.startswith("\\") for tag in (*tags, *writable)):
+            raise ValueError("system flags are not valid email tags")
+        formatted_tags = _validate_flags(tags)
+        formatted_writable = _validate_flags(writable)
+        imap = await self._connect_imap()
+        outcomes: list[TargetMutationOutcome] = []
+        try:
+            await _imap_login(imap, self.email_server.user_name, self.email_server.password.get_secret_value())
+            await _send_imap_id(imap)
+            select_response = await imap.select(_quote_mailbox(mailbox))
+            _raise_for_imap_error(select_response, f"SELECT mailbox {mailbox}")
+            blocked = await self._blocked_uids(imap, email_ids, allowed_senders)
+            for index, email_id in enumerate(email_ids):
+                if email_id in blocked:
+                    outcomes.append(
+                        TargetMutationOutcome(
+                            email_id,
+                            "failed" if report_blocked_mutations else "succeeded",
+                            "sender-policy" if report_blocked_mutations else None,
+                        )
+                    )
+                    continue
+                removal_succeeded = False
+                try:
+                    if replace_existing and writable:
+                        remove_response = await imap.uid("store", email_id, "-FLAGS.SILENT", formatted_writable)
+                        remove_status = _imap_effect_status(remove_response)
+                        if remove_status != "succeeded":
+                            outcomes.append(
+                                TargetMutationOutcome(
+                                    email_id,
+                                    remove_status,
+                                    "tag-replace-remove-rejected"
+                                    if remove_status == "failed"
+                                    else "tag-replace-remove-unknown",
+                                )
+                            )
+                            continue
+                        removal_succeeded = True
+                    if tags:
+                        add_response = await imap.uid("store", email_id, "+FLAGS.SILENT", formatted_tags)
+                        add_status = _imap_effect_status(add_response)
+                        if add_status != "succeeded" and removal_succeeded:
+                            outcomes.append(TargetMutationOutcome(email_id, "unknown", "tag-replace-partial"))
+                        else:
+                            outcomes.append(
+                                TargetMutationOutcome(
+                                    email_id,
+                                    add_status,
+                                    None
+                                    if add_status == "succeeded"
+                                    else "tag-add-rejected"
+                                    if add_status == "failed"
+                                    else "tag-add-unknown",
+                                )
+                            )
+                    else:
+                        outcomes.append(TargetMutationOutcome(email_id, "succeeded"))
+                except asyncio.CancelledError:
+                    outcomes.append(TargetMutationOutcome(email_id, "unknown", "tag-store-unknown"))
+                    for remaining_id in email_ids[index + 1 :]:
+                        if remaining_id in blocked:
+                            outcomes.append(
+                                TargetMutationOutcome(
+                                    remaining_id,
+                                    "failed" if report_blocked_mutations else "succeeded",
+                                    "sender-policy" if report_blocked_mutations else None,
+                                )
+                            )
+                        else:
+                            outcomes.append(TargetMutationOutcome(remaining_id, "failed", "not-attempted"))
+                    break
+                except Exception:
+                    outcomes.append(TargetMutationOutcome(email_id, "unknown", "tag-store-unknown"))
         finally:
             await _best_effort_imap_logout(imap)
         return BatchMutationOutcome(tuple(outcomes))

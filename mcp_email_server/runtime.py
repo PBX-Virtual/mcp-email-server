@@ -12,6 +12,7 @@ from mcp_email_server.application.management import ManagementServices
 from mcp_email_server.application.metadata import MetadataQueryService
 from mcp_email_server.application.mutations import MutationServices
 from mcp_email_server.application.reads import ReadServices
+from mcp_email_server.imap_keywords import ImapKeywordRegistry
 from mcp_email_server.large_results import LocalLargeResultWriter, local_large_results_supported
 
 
@@ -26,6 +27,7 @@ class ApplicationRuntime:
     mutations: MutationServices
     reads: ReadServices
     large_results: LocalLargeResultWriter | None
+    keyword_registry: ImapKeywordRegistry
 
     async def aclose(self) -> None:
         """Close process-scoped resources and remove private result artifacts."""
@@ -35,12 +37,14 @@ class ApplicationRuntime:
 
 @cache
 def get_application_runtime() -> ApplicationRuntime:
+    keyword_registry = ImapKeywordRegistry.load()
     metadata_backend = LocalMetadataBackend()
     mutation_backend = LocalMutationBackend()
     mutation_services = MutationServices.compose(
         mutation_backend,
         mutation_backend,
         LocalMutationProjectionFactory(mutation_backend),
+        keyword_registry,
     )
     read_backend = LocalReadBackend()
     # Inline bounded reads and the management plane remain available; only
@@ -54,6 +58,7 @@ def get_application_runtime() -> ApplicationRuntime:
             metadata_backend,
             metadata_backend,
             LocalMetadataProjectionFactory(metadata_backend),
+            keyword_registry,
         ),
         mutations=mutation_services,
         reads=ReadServices.compose(
@@ -62,8 +67,10 @@ def get_application_runtime() -> ApplicationRuntime:
             mutation_services.mark_read,
             LocalArtifactWriter(),
             large_results,
+            keyword_registry,
         ),
         large_results=large_results,
+        keyword_registry=keyword_registry,
     )
 
 

@@ -656,6 +656,35 @@ identifiers are fixed and contain no account-specific information.
 See [Security](security.md) before enabling attachment downloads or applying
 allowlists.
 
+## Semantic IMAP tags
+
+Semantic tags live in a separate per-installation file:
+
+```text
+~/.config/mcp-email-server/imap_keywords.toml
+```
+
+The MCP process reads this file at startup. It is independent of
+`managed.sqlite3`, and the management UI never writes or reformats it. Define
+tags under the exact configured account name:
+
+```toml
+[accounts.alonso]
+
+[[accounts.alonso.tags]]
+name = "todo"
+keyword = "$label4"
+description = "Messages requiring an action"
+writable = true
+```
+
+`name` and `keyword` are required. `description` defaults to `""`, and
+`writable` defaults to `false`. Consequently, omitting `writable` never grants
+the AI permission to change that tag. Names and keywords must each be unique
+within an account. Keywords must be non-system IMAP keyword atoms; standard
+flags such as `\Seen` are rejected. Restart the MCP server after editing the
+file.
+
 ## Environment variable reference
 
 ### Account variables

@@ -94,6 +94,64 @@ async def test_set_email_flags_removes_multiple_flags_with_silent_store(email_se
 
 
 @pytest.mark.asyncio
+async def test_set_email_tags_adds_keywords_without_removing_existing(email_server) -> None:
+    client = EmailClient(email_server)
+    imap = _imap()
+    with patch.object(client, "_connect_imap", AsyncMock(return_value=imap)):
+        result = await client.set_email_tags_with_outcome(
+            ["8", "9"],
+            ["$label4"],
+            writable_keywords=["$label4", "$label1"],
+            allowed_senders=[],
+        )
+
+    assert result.targets("succeeded") == ["8", "9"]
+    assert [call.args for call in imap.uid.await_args_list] == [
+        ("store", "8", "+FLAGS.SILENT", "($label4)"),
+        ("store", "9", "+FLAGS.SILENT", "($label4)"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_set_email_tags_replace_removes_only_writable_keywords_then_adds(email_server) -> None:
+    client = EmailClient(email_server)
+    imap = _imap()
+    with patch.object(client, "_connect_imap", AsyncMock(return_value=imap)):
+        result = await client.set_email_tags_with_outcome(
+            ["8"],
+            ["$label4"],
+            replace_existing=True,
+            writable_keywords=["$label4", "$label1"],
+            allowed_senders=[],
+        )
+
+    assert result.targets("succeeded") == ["8"]
+    assert [call.args for call in imap.uid.await_args_list] == [
+        ("store", "8", "-FLAGS.SILENT", "($label4 $label1)"),
+        ("store", "8", "+FLAGS.SILENT", "($label4)"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_set_email_tags_empty_replace_clears_only_writable_keywords(email_server) -> None:
+    client = EmailClient(email_server)
+    imap = _imap()
+    with patch.object(client, "_connect_imap", AsyncMock(return_value=imap)):
+        result = await client.set_email_tags_with_outcome(
+            ["8"],
+            [],
+            replace_existing=True,
+            writable_keywords=["$label4"],
+            allowed_senders=[],
+        )
+
+    assert result.targets("succeeded") == ["8"]
+    assert [call.args for call in imap.uid.await_args_list] == [
+        ("store", "8", "-FLAGS.SILENT", "($label4)"),
+    ]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("operation", "flags", "message"),
     [

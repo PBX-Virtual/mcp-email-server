@@ -15,6 +15,7 @@ from mcp_email_server.application.limits import (
     validate_serialized_result,
 )
 from mcp_email_server.application.metadata import RuntimeMode
+from mcp_email_server.imap_keywords import ImapKeywordRegistry
 
 MutationStatus = Literal["succeeded", "failed", "unknown"]
 MutationProviderPurpose = Literal["incoming", "outgoing", "sent-copy"]
@@ -161,6 +162,35 @@ class SetEmailFlagsCommand:
             raise ValueError("flags must not contain duplicates")
         if any(flag not in MUTABLE_EMAIL_FLAGS for flag in self.flags):
             raise ValueError("flags contain an unsupported mutable email flag")
+
+
+@dataclass(frozen=True)
+class SetEmailTagsCommand:
+    account_name: str
+    email_ids: tuple[str, ...]
+    tags: tuple[str, ...]
+    mailbox: str = "INBOX"
+    replace_existing: bool = False
+    writable_keywords: tuple[str, ...] = ()
+
+    def validate(self) -> None:
+        _validate_account_name(self.account_name)
+        _validate_email_ids(self.email_ids)
+        validate_mailbox_name(self.mailbox)
+        if not self.tags and not self.replace_existing:
+            raise ValueError("tags must not be empty unless replace_existing is true")
+        if len(self.tags) > APPLICATION_LIMITS.flags:
+            raise ValueError(f"tags must contain at most {APPLICATION_LIMITS.flags} values")
+        if any(not isinstance(tag, str) for tag in self.tags):
+            raise ValueError("tags must contain strings")
+        if len(set(self.tags)) != len(self.tags):
+            raise ValueError("tags must not contain duplicates")
+        for tag in self.tags:
+            validate_controlled_string(
+                tag,
+                field_name="tags item",
+                maximum_bytes=APPLICATION_LIMITS.flag_bytes,
+            )
 
 
 @dataclass(frozen=True)
@@ -376,6 +406,12 @@ class MutationProvider(Protocol):
     async def set_flags(
         self,
         command: SetEmailFlagsCommand,
+        account: MutationAccountSnapshot,
+    ) -> BatchMutationOutcome: ...
+
+    async def set_tags(
+        self,
+        command: SetEmailTagsCommand,
         account: MutationAccountSnapshot,
     ) -> BatchMutationOutcome: ...
 
@@ -907,6 +943,44 @@ class SetEmailFlagsService(_MutationWorkflow):
         )
 
 
+class SetEmailTagsService(_MutationWorkflow):
+    def __init__(
+        self,
+        accounts: MutationAccountAuthority,
+        providers: MutationProviderFactory,
+        projections: MutationProjectionFactory,
+        keyword_registry: ImapKeywordRegistry,
+    ) -> None:
+        super().__init__(accounts, providers, projections)
+        self._keyword_registry = keyword_registry
+
+    async def execute(self, command: SetEmailTagsCommand) -> BatchMutationOutcome:
+        command.validate()
+        account = self._resolve(command.account_name)
+        resolved = self._keyword_registry.resolve(command.account_name, command.tags, require_writable=True)
+        provider_command = replace(
+            command,
+            tags=resolved,
+            writable_keywords=self._keyword_registry.writable_keywords(command.account_name),
+        )
+        access = self._open(account)
+        try:
+            outcome = _validate_batch_result(
+                await _bounded_provider_effect(access.provider.set_tags(provider_command, access.account))
+            )
+        except TimeoutError:
+            outcome = _validate_batch_result(_timeout_batch(command.email_ids))
+        if not outcome.effect_may_have_started:
+            return outcome
+        invalidated = await self._invalidate(access.account, (command.mailbox,))
+        return _validate_batch_result(
+            BatchMutationOutcome(
+                outcome.outcomes,
+                reconciliation_needed=outcome.reconciliation_needed or not invalidated,
+            )
+        )
+
+
 class MarkReadService:
     """Focused mark-read executor backed by the generic mutable-flag workflow."""
 
@@ -1128,6 +1202,7 @@ class ForwardService(_MutationWorkflow):
 @dataclass(frozen=True)
 class MutationServices:
     set_flags: SetEmailFlagsService
+    set_tags: SetEmailTagsService
     mark_read: MarkReadService
     save_to_mailbox: SaveToMailboxService
     delete: DeleteService
@@ -1142,11 +1217,14 @@ class MutationServices:
         accounts: MutationAccountAuthority,
         providers: MutationProviderFactory,
         projections: MutationProjectionFactory,
+        keyword_registry: ImapKeywordRegistry | None = None,
     ) -> MutationServices:
         arguments = (accounts, providers, projections)
         set_flags = SetEmailFlagsService(*arguments)
+        registry = keyword_registry or ImapKeywordRegistry(accounts={})
         return cls(
             set_flags=set_flags,
+            set_tags=SetEmailTagsService(*arguments, registry),
             mark_read=MarkReadService(set_flags),
             save_to_mailbox=SaveToMailboxService(*arguments),
             delete=DeleteService(*arguments),

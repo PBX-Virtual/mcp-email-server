@@ -16,19 +16,21 @@ The delivery maintains a reviewable matrix using the following ownership. Exact
 file names may evolve, but every row must have concrete code and test references
 before release.
 
-| Contract area                                      | Owning spec | Required evidence                                                                           |
-| -------------------------------------------------- | ----------- | ------------------------------------------------------------------------------------------- |
-| foreground process and trust boundaries            | 01          | startup/shutdown, fail-closed, and route/transport tests                                    |
-| identities, revisions, outcomes, bounds vocabulary | 02          | domain purity and invariant tests                                                           |
-| layers, late secrets, resource/transaction scopes  | 03          | import/architecture, isolation, lifecycle, and transaction tests                            |
-| mode, catalog/account/policy/import lifecycle      | 04          | application + CLI + UI contract and crash/conflict tests                                    |
-| secret rotation/removal/cleanup/redaction          | 05          | atomic activation, unchanged-authority failure, leakage, and parity tests                   |
-| mailbox/index/body/attachment reads                | 06          | provider fakes, SQLite, filesystem race, bounds, and GreenMail tests                        |
-| mutations and independent effects                  | 07          | capability, ambiguity, cancellation, no-bare-expunge, SMTP/sent-copy tests                  |
-| schema, WAL/SHM security, retention/rebuild        | 08          | exact schema/migration, POSIX + native Windows pre-open race, concurrency, corruption tests |
-| loopback UI security and packaging                 | 09          | backend, frontend, real-browser, artifact, and no-Node tests                                |
-| exact MCP contract and stdio behavior              | 10          | catalog snapshot, raw protocol, generic client, and GreenMail E2E                           |
-| agent integration and safe setup handoff           | 11          | Codex/Claude Code install fixtures, scenario, drift, and no-secret tests                    |
+| Contract area                                      | Owning spec    | Required evidence                                                                           |
+| -------------------------------------------------- | -------------- | ------------------------------------------------------------------------------------------- |
+| foreground process and trust boundaries            | 01             | startup/shutdown, fail-closed, and route/transport tests                                    |
+| identities, revisions, outcomes, bounds vocabulary | 02             | domain purity and invariant tests                                                           |
+| layers, late secrets, resource/transaction scopes  | 03             | import/architecture, isolation, lifecycle, and transaction tests                            |
+| mode, catalog/account/policy/import lifecycle      | 04             | application + CLI + UI contract and crash/conflict tests                                    |
+| secret rotation/removal/cleanup/redaction          | 05             | atomic activation, unchanged-authority failure, leakage, and parity tests                   |
+| mailbox/index/body/attachment reads                | 06             | provider fakes, SQLite, filesystem race, bounds, and GreenMail tests                        |
+| mutations and independent effects                  | 07             | capability, ambiguity, cancellation, no-bare-expunge, SMTP/sent-copy tests                  |
+| schema, WAL/SHM security, retention/rebuild        | 08             | exact schema/migration, POSIX + native Windows pre-open race, concurrency, corruption tests |
+| loopback UI security and packaging                 | 09             | backend, frontend, real-browser, artifact, and no-Node tests                                |
+| exact MCP contract and stdio behavior              | 10             | catalog snapshot, raw protocol, generic client, and GreenMail E2E                           |
+| semantic keyword configuration and tag workflows   | 04, 06, 07, 10 | parser/default/validation, provider/projection, mutation, catalog, and GreenMail E2E        |
+| embedded attachment content                        | 06, 10         | MIME matrix, permission/size bounds, catalog, raw protocol, and GreenMail E2E               |
+| agent integration and safe setup handoff           | 11             | Codex/Claude Code install fixtures, scenario, drift, and no-secret tests                    |
 
 ### Checked Delivery References
 

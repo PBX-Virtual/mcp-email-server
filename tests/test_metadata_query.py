@@ -22,6 +22,7 @@ from mcp_email_server.application.metadata import (
     MetadataQueryService,
 )
 from mcp_email_server.emails.models import EmailMetadata, EmailMetadataPageResponse, MailboxInfo
+from mcp_email_server.imap_keywords import ImapKeywordAccount, ImapKeywordRegistry, ImapKeywordTag
 
 NOW = datetime(2026, 7, 22, 4, 0, tzinfo=UTC)
 
@@ -55,6 +56,7 @@ def _fallback_response(subject: str | None = None) -> EmailMetadataPageResponse:
 
 def _service(
     mode: str = "legacy",
+    keyword_registry: ImapKeywordRegistry | None = None,
 ) -> tuple[MetadataQueryService, MagicMock, MagicMock, MagicMock, MagicMock, MagicMock]:
     account = MetadataAccountSnapshot(
         account_name="work",
@@ -67,6 +69,7 @@ def _service(
     provider.list_metadata = AsyncMock(return_value=_fallback_response())
     provider.mailbox_state = AsyncMock(return_value=MailboxState(7, 4, 3))
     provider.mailbox_snapshot = AsyncMock()
+    provider.flags_for = AsyncMock(side_effect=lambda _mailbox, email_ids: {uid: [] for uid in email_ids})
     providers = MagicMock()
     providers.open.return_value = MetadataProviderAccess(account=account, provider=provider)
     projection = MagicMock()
@@ -75,13 +78,76 @@ def _service(
     projections = MagicMock()
     projections.open = AsyncMock(return_value=projection)
     return (
-        MetadataQueryService(accounts, providers, projections),
+        MetadataQueryService(accounts, providers, projections, keyword_registry),
         accounts,
         providers,
         projections,
         provider,
         projection,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tag_match", "expected"),
+    [("all", ["3"]), ("any", ["3", "2"])],
+)
+async def test_tag_filters_use_provider_before_pagination_and_map_names(
+    tag_match: str,
+    expected: list[str],
+) -> None:
+    registry = ImapKeywordRegistry(
+        accounts={
+            "work": ImapKeywordAccount(
+                tags=(
+                    ImapKeywordTag(name="todo", keyword="$label4"),
+                    ImapKeywordTag(name="important", keyword="$label1"),
+                )
+            )
+        }
+    )
+    service, _accounts, _providers, projections, provider, _projection = _service("managed", registry)
+    selected = [EmailMetadata.from_email({**_email(3), "_flags": ["$label4", "$label1", r"\Seen"]})]
+    if tag_match == "any":
+        selected.append(EmailMetadata.from_email({**_email(2), "_flags": ["$label4", "unknown"]}))
+    provider.list_metadata.return_value = EmailMetadataPageResponse(
+        page=1,
+        page_size=10,
+        before=None,
+        since=None,
+        subject=None,
+        emails=selected,
+        total=len(selected),
+    )
+
+    response = await service.execute(
+        ListEmailMetadataQuery(
+            account_name="work",
+            page_size=10,
+            tags=("todo", "$label1"),
+            tag_match=tag_match,  # type: ignore[arg-type]
+        )
+    )
+
+    assert [email.email_id for email in response.emails] == expected
+    assert response.emails[0].tags == ["$label4", "$label1"]
+    assert response.emails[0].tag_names == ["todo", "important"]
+    provider.list_metadata.assert_awaited_once()
+    dispatched = provider.list_metadata.await_args.args[0]
+    assert dispatched.tags == ("$label4", "$label1")
+    projections.open.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unknown_tag_filter_fails_before_provider_or_projection() -> None:
+    registry = ImapKeywordRegistry(accounts={"work": ImapKeywordAccount()})
+    service, _accounts, providers, projections, _provider, _projection = _service("managed", registry)
+
+    with pytest.raises(ValueError, match="Unknown configured email tag"):
+        await service.execute(ListEmailMetadataQuery(account_name="work", tags=("missing",)))
+
+    providers.open.assert_not_called()
+    projections.open.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -97,6 +163,23 @@ async def test_complete_index_answers_exact_page_after_provider_state_qualificat
     provider.mailbox_snapshot.assert_not_awaited()
     provider.list_metadata.assert_not_awaited()
     providers.open.assert_called_once_with("work", expected_mode="managed")
+
+
+@pytest.mark.asyncio
+async def test_complete_index_refreshes_current_tags_for_returned_page() -> None:
+    registry = ImapKeywordRegistry(
+        accounts={"work": ImapKeywordAccount(tags=(ImapKeywordTag(name="todo", keyword="$label4"),))}
+    )
+    service, _accounts, _providers, _projections, provider, projection = _service("managed", registry)
+    projection.read_complete.return_value = [{**_email(1), "_flags": ["stale-keyword"]}]
+    provider.flags_for.side_effect = None
+    provider.flags_for.return_value = {"1": [r"\Seen", "$label4", "unknown"]}
+
+    response = await service.execute(ListEmailMetadataQuery(account_name="work"))
+
+    assert response.emails[0].tags == ["$label4", "unknown"]
+    assert response.emails[0].tag_names == ["todo"]
+    provider.flags_for.assert_awaited_once_with("INBOX", ("1",))
 
 
 @pytest.mark.asyncio

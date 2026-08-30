@@ -312,6 +312,23 @@ reader, directory listing, remote URL, or arbitrary path lookup is exposed by
 this feature. Only connect a local MCP client whose own filesystem tools may
 legitimately inspect paths returned by the server.
 
+## Semantic tags and embedded attachments
+
+`imap_keywords.toml` contains no credentials, but its semantic names and
+provider keywords can reveal mailbox organization. Keep it private alongside
+the main configuration. It is read once when MCP starts and is never rewritten
+by the UI or managed catalog. Tag writes fail closed: `writable` defaults to
+`false`, and only an explicit `true` authorizes `set_email_tags` to add or remove
+that configured keyword. The workflow never modifies standard flags, read-only
+configured tags, or unknown provider keywords.
+
+`get_attachment_content` does not create a local artifact, but it transfers the
+original decoded bytes through MCP and therefore exposes private message content
+to the connected MCP host. It is gated by the same
+`enable_attachment_download=true` policy as filesystem download and rechecks
+that policy after fetch. Only enable it for a trusted local MCP client. A single
+decoded attachment is limited to 25 MiB.
+
 ## Indexed metadata privacy
 
 The operational SQLite projection contains no message bodies, raw MIME,

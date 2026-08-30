@@ -288,6 +288,22 @@ second = await get_emails_content(
 Keep the mailbox argument consistent with the mailbox used to obtain the
 `email_id`.
 
+## Work with semantic email tags
+
+Start by calling `list_email_tags(account_name="work")`. A request such as
+“messages requiring an action” can then resolve to the configured `todo` name.
+Filter with `list_emails_metadata(tags=["todo"], tag_match="all")`, or pass the
+configured keyword directly. To add the tag, call
+`set_email_tags(email_ids=["123"], tags=["todo"])`. Replacement affects only
+tags explicitly configured with `writable=true`; use
+`set_email_tags(email_ids=["123"], tags=[], replace_existing=true)` to clear
+that writable subset while preserving every other keyword and standard flag.
+
+To let the MCP host analyze an attachment without choosing a server filesystem
+path, call `get_attachment_content` with the message ID and filename returned by
+`get_emails_content`. The feature must first be enabled with
+`enable_attachment_download=true`.
+
 ## Import legacy accounts into a managed catalog
 
 Create the destination while keeping legacy runtime selected, preview the
